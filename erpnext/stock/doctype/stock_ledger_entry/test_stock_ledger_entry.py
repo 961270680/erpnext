@@ -5,9 +5,15 @@ import json
 
 import frappe
 from frappe.core.page.permission_manager.permission_manager import reset
+<<<<<<< HEAD
 from frappe.tests.utils import FrappeTestCase, change_settings
+=======
+from frappe.custom.doctype.property_setter.property_setter import make_property_setter
+from frappe.tests.utils import FrappeTestCase
+>>>>>>> c2aad115c1 (fix: disable deferred naming on SLE/GLE if hash method is used.  (#30286))
 from frappe.utils import add_days, today
 
+from erpnext.accounts.doctype.gl_entry.gl_entry import rename_gle_sle_docs
 from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
 from erpnext.stock.doctype.item.test_item import make_item
 from erpnext.stock.doctype.landed_cost_voucher.test_landed_cost_voucher import (
@@ -529,3 +535,180 @@ def create_items():
 		make_item(d, properties=properties)
 
 	return items
+<<<<<<< HEAD
+=======
+
+def setup_item_valuation_test(valuation_method="FIFO", suffix=None, use_batchwise_valuation=1, batches_list=['X', 'Y']):
+	from erpnext.stock.doctype.batch.batch import make_batch
+	from erpnext.stock.doctype.item.test_item import make_item
+	from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+
+	if not suffix:
+		suffix = get_unique_suffix()
+
+	item = make_item(
+		f"IV - Test Item {valuation_method} {suffix}",
+		dict(valuation_method=valuation_method, has_batch_no=1, create_new_batch=1)
+	)
+	warehouses = [create_warehouse(f"IV - Test Warehouse {i}") for i in ['J', 'K']]
+	batches = [f"IV - Test Batch {i} {valuation_method} {suffix}" for i in batches_list]
+
+	for i, batch_id in enumerate(batches):
+		if not frappe.db.exists("Batch", batch_id):
+			ubw = use_batchwise_valuation
+			if isinstance(use_batchwise_valuation, (list, tuple)):
+				ubw = use_batchwise_valuation[i]
+			batch = frappe.get_doc(frappe._dict(
+					doctype="Batch",
+					batch_id=batch_id,
+					item=item.item_code,
+					use_batchwise_valuation=ubw
+				)
+			).insert()
+			batch.use_batchwise_valuation = ubw
+			batch.db_update()
+
+	return item.item_code, warehouses, batches
+
+def create_purchase_receipt_entries_for_batchwise_item_valuation_test(pr_entry_list):
+	from erpnext.stock.doctype.purchase_receipt.test_purchase_receipt import make_purchase_receipt
+	prs = []
+
+	for item, warehouse, batch_no, qty, rate in pr_entry_list:
+		pr = make_purchase_receipt(item=item, warehouse=warehouse, qty=qty, rate=rate, batch_no=batch_no)
+		prs.append(pr)
+
+	return prs
+
+def create_delivery_note_entries_for_batchwise_item_valuation_test(dn_entry_list):
+	from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+	from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
+	dns = []
+	for item, warehouse, batch_no, qty, rate in dn_entry_list:
+		so = make_sales_order(
+			rate=rate,
+			qty=qty,
+			item=item,
+			warehouse=warehouse,
+			against_blanket_order=0
+		)
+
+		dn = make_delivery_note(so.name)
+		dn.items[0].batch_no = batch_no
+		dn.insert()
+		dn.submit()
+		dns.append(dn)
+	return dns
+
+def fetch_sle_details_for_doc_list(doc_list, columns, as_dict=1):
+	return frappe.db.sql(f"""
+		SELECT { ', '.join(columns)}
+		FROM `tabStock Ledger Entry`
+		WHERE
+			voucher_no IN %(voucher_nos)s
+			and docstatus = 1
+		ORDER BY timestamp(posting_date, posting_time) ASC, CREATION ASC
+	""", dict(
+		voucher_nos=[doc.name for doc in doc_list]
+	), as_dict=as_dict)
+
+def get_stock_value_from_q(q):
+	return sum(r*q for r,q in json.loads(q))
+
+def create_stock_entry_entries_for_batchwise_item_valuation_test(se_entry_list, purpose):
+	ses = []
+	for item, source, target, batch, qty, rate, posting_date in se_entry_list:
+		args = dict(
+			item_code=item,
+			qty=qty,
+			company="_Test Company",
+			batch_no=batch,
+			posting_date=posting_date,
+			purpose=purpose
+		)
+
+		if purpose == "Material Receipt":
+			args.update(
+				dict(to_warehouse=target, rate=rate)
+			)
+
+		elif purpose == "Material Issue":
+			args.update(
+				dict(from_warehouse=source)
+			)
+
+		elif purpose == "Material Transfer":
+			args.update(
+				dict(from_warehouse=source, to_warehouse=target)
+			)
+
+		else:
+			raise ValueError(f"Invalid purpose: {purpose}")
+		ses.append(make_stock_entry(**args))
+
+	return ses
+
+def get_unique_suffix():
+	# Used to isolate valuation sensitive
+	# tests to prevent future tests from failing.
+	return str(uuid4())[:8].upper()
+
+
+class TestDeferredNaming(FrappeTestCase):
+
+	@classmethod
+	def setUpClass(cls) -> None:
+		super().setUpClass()
+		cls.gle_autoname = frappe.get_meta("GL Entry").autoname
+		cls.sle_autoname = frappe.get_meta("Stock Ledger Entry").autoname
+
+	def setUp(self) -> None:
+		self.item = make_item().name
+		self.warehouse = "Stores - TCP1"
+		self.company = "_Test Company with perpetual inventory"
+
+	def tearDown(self) -> None:
+		make_property_setter(doctype="GL Entry", for_doctype=True,
+				property="autoname", value=self.gle_autoname, property_type="Data", fieldname=None)
+		make_property_setter(doctype="Stock Ledger Entry", for_doctype=True,
+				property="autoname", value=self.sle_autoname, property_type="Data", fieldname=None)
+
+		# since deferred naming autocommits, commit all changes to avoid flake
+		frappe.db.commit()  # nosemgrep
+
+	@staticmethod
+	def get_gle_sles(se):
+		filters = {"voucher_type": se.doctype, "voucher_no": se.name}
+		gle = set(frappe.get_list("GL Entry", filters, pluck="name"))
+		sle = set(frappe.get_list("Stock Ledger Entry", filters, pluck="name"))
+		return gle, sle
+
+	def test_deferred_naming(self):
+		se = make_stock_entry(item_code=self.item, to_warehouse=self.warehouse,
+				qty=10, rate=100, company=self.company)
+
+		gle, sle = self.get_gle_sles(se)
+		rename_gle_sle_docs()
+		renamed_gle, renamed_sle  = self.get_gle_sles(se)
+
+		self.assertFalse(gle & renamed_gle, msg="GLEs not renamed")
+		self.assertFalse(sle & renamed_sle, msg="SLEs not renamed")
+		se.cancel()
+
+	def test_hash_naming(self):
+		# disable naming series
+		for doctype in ("GL Entry", "Stock Ledger Entry"):
+			make_property_setter(doctype=doctype, for_doctype=True,
+					property="autoname", value="hash", property_type="Data", fieldname=None)
+
+		se = make_stock_entry(item_code=self.item, to_warehouse=self.warehouse,
+				qty=10, rate=100, company=self.company)
+
+		gle, sle = self.get_gle_sles(se)
+		rename_gle_sle_docs()
+		renamed_gle, renamed_sle  = self.get_gle_sles(se)
+
+		self.assertEqual(gle, renamed_gle, msg="GLEs are renamed while using hash naming")
+		self.assertEqual(sle, renamed_sle, msg="SLEs are renamed while using hash naming")
+		se.cancel()
+>>>>>>> c2aad115c1 (fix: disable deferred naming on SLE/GLE if hash method is used.  (#30286))
